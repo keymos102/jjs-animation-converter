@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>JJS Animation Converter</title>
+
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+
+    <main>
+        <h1>JJS Animation Converter</h1>
+
+        <section>
+            <label for="rbxmInput">RBXM file</label>
+            <input
+                id="rbxmInput"
+                type="file"
+                accept=".rbxm"
+            >
+        </section>
+
+        <section>
+            <label for="sourceInput">JSON / Zstandard Base64</label>
+
+            <textarea
+                id="sourceInput"
+                rows="15"
+                placeholder="Paste JSON or Zstandard Base64 here..."
+            ></textarea>
+        </section>
+
+        <section>
+            <h2>Animation Offset</h2>
+
+            <label>
+                X:
+                <input id="offsetX" type="number" value="0" step="any">
+            </label>
+
+            <label>
+                Y:
+                <input id="offsetY" type="number" value="0" step="any">
+            </label>
+
+            <label>
+                Z:
+                <input id="offsetZ" type="number" value="0" step="any">
+            </label>
+        </section>
+
+        <section>
+            <button id="convertButton">Convert</button>
+        </section>
+
+        <section>
+            <label for="outputInput">Zstandard Base64</label>
+
+            <textarea
+                id="outputInput"
+                rows="15"
+                readonly
+                placeholder="Converted result will appear here..."
+            ></textarea>
+
+            <button id="copyButton">Copy</button>
+        </section>
+
+        <p id="status"></p>
+    </main>
+
+    <script type="module" src="./js/app.js"></script>
+
+</body>
+</html> 

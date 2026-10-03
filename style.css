@@ -1,0 +1,29 @@
+body {
+    font-family: sans-serif;
+}
+
+main {
+    max-width: 900px;
+    margin: 40px auto;
+}
+
+section {
+    margin-bottom: 20px;
+}
+
+textarea {
+    display: block;
+    width: 100%;
+    box-sizing: border-box;
+    resize: vertical;
+}
+
+label {
+    display: block;
+    margin-bottom: 8px;
+}
+
+input,
+button {
+    margin: 4px;
+}
