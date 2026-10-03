@@ -1,2722 +1,1385 @@
+// js/rbxm.js
+
 "use strict";
 
 /*
- * JJS Animation Converter
  * Binary RBXM reader
  *
- * No npm.
- * No external libraries.
+ * Пока наша задача:
+ *  - прочитать Binary .rbxm;
+ *  - восстановить Instance tree;
+ *  - прочитать основные свойства;
+ *  - нормально прочитать KeyframeSequence / Keyframe / Pose;
+ *  - прочитать CFrame;
  *
- * Current scope:
- * - Binary .rbxm
- * - INST
- * - PROP
- * - PRNT
- * - META
- * - SSTR
- * - KeyframeSequence
- * - Keyframe
- * - Pose
- * - R6 / R15 animation hierarchy
- *
- * Intentionally ignored:
- * - Accessory
- * - Shirt
- * - Pants
- * - Hair
- * - MeshPart geometry
- *
- * Compression:
- * - uncompressed chunks: supported
- * - LZ4 chunks: supported
- * - ZSTD chunks: detected, but requires an external decoder
+ * На данном этапе мы НЕ занимаемся:
+ *  - MeshPart / MeshId;
+ *  - Accessories;
+ *  - Hair;
+ *  - Clothing;
+ *  - Part geometry;
+ *  - JJS conversion.
  */
 
+const RBXM = (() => {
 
-/* =========================================================
- * PUBLIC API
- * ======================================================= */
+    // =========================================================
+    // Reader
+    // =========================================================
 
-async function parseRBXM(file) {
-    if (!(file instanceof Blob)) {
-        throw new TypeError(
-            "parseRBXM(file): file must be a File or Blob."
-        );
-    }
+    class Reader {
+        constructor(buffer) {
+            this.buffer = buffer instanceof ArrayBuffer
+                ? buffer
+                : buffer.buffer.slice(
+                    buffer.byteOffset,
+                    buffer.byteOffset + buffer.byteLength
+                );
 
-    const buffer = await file.arrayBuffer();
-
-    return parseRBXMBuffer(buffer);
-}
-
-
-function parseRBXMBuffer(buffer) {
-    const reader = new BinaryReader(buffer);
-
-    const header = readHeader(reader);
-
-    const chunks = [];
-
-    let reachedEnd = false;
-
-    while (!reader.eof()) {
-        const chunk = readChunk(reader);
-
-        if (!chunk) {
-            break;
+            this.bytes = new Uint8Array(this.buffer);
+            this.view = new DataView(this.buffer);
+            this.offset = 0;
         }
 
-        chunks.push(chunk);
-
-        if (chunk.name === "END") {
-            reachedEnd = true;
-            break;
-        }
-    }
-
-    if (!reachedEnd) {
-        throw new Error(
-            "RBXM file ended before END chunk."
-        );
-    }
-
-    const parsed = parseChunks(
-        chunks,
-        header
-    );
-
-    const instances = buildInstanceTree(parsed);
-
-    const character = extractCharacter(
-        instances
-    );
-
-    const animation = extractAnimation(
-        instances
-    );
-
-    return {
-        format: "RBXM",
-        version: header.version,
-
-        header,
-
-        chunks,
-
-        instances,
-
-        character,
-
-        animation,
-
-        warnings: parsed.warnings
-    };
-}
-
-
-/* =========================================================
- * BINARY READER
- * ======================================================= */
-
-class BinaryReader {
-
-    constructor(buffer) {
-        this.buffer = buffer;
-
-        this.bytes = new Uint8Array(buffer);
-
-        this.view = new DataView(buffer);
-
-        this.offset = 0;
-    }
-
-
-    eof() {
-        return this.offset >= this.bytes.length;
-    }
-
-
-    remaining() {
-        return this.bytes.length - this.offset;
-    }
-
-
-    ensure(length) {
-        if (
-            this.offset + length >
-            this.bytes.length
-        ) {
-            throw new Error(
-                "Unexpected end of RBXM data."
-            );
-        }
-    }
-
-
-    seek(position) {
-        if (
-            position < 0 ||
-            position > this.bytes.length
-        ) {
-            throw new Error(
-                "Invalid binary reader position."
-            );
+        get remaining() {
+            return this.bytes.length - this.offset;
         }
 
-        this.offset = position;
-    }
+        ensure(size) {
+            if (this.offset + size > this.bytes.length) {
+                throw new Error(
+                    `Unexpected end of data at 0x${this.offset.toString(16)}`
+                );
+            }
+        }
 
+        u8() {
+            this.ensure(1);
+            return this.bytes[this.offset++];
+        }
 
-    skip(length) {
-        this.ensure(length);
+        i8() {
+            this.ensure(1);
+            return this.view.getInt8(this.offset++);
+        }
 
-        this.offset += length;
-    }
+        u16le() {
+            this.ensure(2);
+            const value = this.view.getUint16(this.offset, true);
+            this.offset += 2;
+            return value;
+        }
 
+        u32le() {
+            this.ensure(4);
+            const value = this.view.getUint32(this.offset, true);
+            this.offset += 4;
+            return value;
+        }
 
-    u8() {
-        this.ensure(1);
+        i32le() {
+            this.ensure(4);
+            const value = this.view.getInt32(this.offset, true);
+            this.offset += 4;
+            return value;
+        }
 
-        const value =
-            this.view.getUint8(this.offset);
+        i32be() {
+            this.ensure(4);
+            const value = this.view.getInt32(this.offset, false);
+            this.offset += 4;
+            return value;
+        }
 
-        this.offset += 1;
+        u32be() {
+            this.ensure(4);
+            const value = this.view.getUint32(this.offset, false);
+            this.offset += 4;
+            return value;
+        }
 
-        return value;
-    }
+        f32le() {
+            this.ensure(4);
+            const value = this.view.getFloat32(this.offset, true);
+            this.offset += 4;
+            return value;
+        }
 
+        f32be() {
+            this.ensure(4);
+            const value = this.view.getFloat32(this.offset, false);
+            this.offset += 4;
+            return value;
+        }
 
-    i8() {
-        this.ensure(1);
+        f64le() {
+            this.ensure(8);
+            const value = this.view.getFloat64(this.offset, true);
+            this.offset += 8;
+            return value;
+        }
 
-        const value =
-            this.view.getInt8(this.offset);
+        bytesSlice(length) {
+            this.ensure(length);
 
-        this.offset += 1;
-
-        return value;
-    }
-
-
-    u16() {
-        this.ensure(2);
-
-        const value =
-            this.view.getUint16(
-                this.offset,
-                true
-            );
-
-        this.offset += 2;
-
-        return value;
-    }
-
-
-    i16() {
-        this.ensure(2);
-
-        const value =
-            this.view.getInt16(
-                this.offset,
-                true
-            );
-
-        this.offset += 2;
-
-        return value;
-    }
-
-
-    u32() {
-        this.ensure(4);
-
-        const value =
-            this.view.getUint32(
-                this.offset,
-                true
-            );
-
-        this.offset += 4;
-
-        return value;
-    }
-
-
-    i32() {
-        this.ensure(4);
-
-        const value =
-            this.view.getInt32(
-                this.offset,
-                true
-            );
-
-        this.offset += 4;
-
-        return value;
-    }
-
-
-    f32() {
-        this.ensure(4);
-
-        const value =
-            this.view.getFloat32(
-                this.offset,
-                true
-            );
-
-        this.offset += 4;
-
-        return value;
-    }
-
-
-    f64() {
-        this.ensure(8);
-
-        const value =
-            this.view.getFloat64(
-                this.offset,
-                true
-            );
-
-        this.offset += 8;
-
-        return value;
-    }
-
-
-    bytesArray(length) {
-        this.ensure(length);
-
-        const value =
-            this.bytes.slice(
+            const result = this.bytes.slice(
                 this.offset,
                 this.offset + length
             );
 
-        this.offset += length;
+            this.offset += length;
 
-        return value;
-    }
-
-
-    string(length) {
-        return new TextDecoder(
-            "utf-8"
-        ).decode(
-            this.bytesArray(length)
-        );
-    }
-
-
-    remainingBytes() {
-        return this.bytes.slice(
-            this.offset
-        );
-    }
-}
-
-
-/* =========================================================
- * HEADER
- * ======================================================= */
-
-function readHeader(reader) {
-
-    const magic = reader.string(8);
-
-    if (magic !== "<roblox!") {
-        throw new Error(
-            "This file is not a Binary RBXM file."
-        );
-    }
-
-
-    const signature =
-        reader.bytesArray(6);
-
-    const expected = [
-        0x89,
-        0xff,
-        0x0d,
-        0x0a,
-        0x1a,
-        0x0a
-    ];
-
-
-    for (
-        let i = 0;
-        i < expected.length;
-        i++
-    ) {
-        if (
-            signature[i] !==
-            expected[i]
-        ) {
-            throw new Error(
-                "Invalid RBXM signature."
-            );
+            return result;
         }
-    }
 
-
-    const version = reader.u16();
-
-    if (version !== 0) {
-        throw new Error(
-            `Unsupported RBXM version: ${version}`
-        );
-    }
-
-
-    const classCount = reader.i32();
-
-    const instanceCount = reader.i32();
-
-    const reserved =
-        reader.bytesArray(8);
-
-
-    return {
-        version,
-        classCount,
-        instanceCount,
-        reserved
-    };
-}
-
-
-/* =========================================================
- * CHUNKS
- * ======================================================= */
-
-function readChunk(reader) {
-
-    if (reader.remaining() < 16) {
-        return null;
-    }
-
-
-    const nameBytes =
-        reader.bytesArray(4);
-
-    let name = "";
-
-    for (const byte of nameBytes) {
-        if (byte !== 0) {
-            name += String.fromCharCode(
-                byte
-            );
-        }
-    }
-
-
-    const compressedLength =
-        reader.u32();
-
-    const uncompressedLength =
-        reader.u32();
-
-    reader.u32(); // reserved
-
-
-    const storedData =
-        reader.bytesArray(
-            compressedLength ||
-            uncompressedLength
-        );
-
-
-    let data;
-
-
-    if (compressedLength === 0) {
-
-        data = storedData;
-
-    } else {
-
-        data =
-            decompressChunk(
-                storedData,
-                uncompressedLength,
-                name
-            );
-    }
-
-
-    return {
-        name,
-
-        compressedLength,
-
-        uncompressedLength,
-
-        data
-    };
-}
-
-
-/* =========================================================
- * COMPRESSION
- * ======================================================= */
-
-function decompressChunk(
-    data,
-    expectedLength,
-    chunkName
-) {
-
-    if (
-        data.length >= 4 &&
-        data[0] === 0x28 &&
-        data[1] === 0xb5 &&
-        data[2] === 0x2f &&
-        data[3] === 0xfd
-    ) {
-
-        throw new Error(
-            `Chunk "${chunkName}" uses ZSTD compression. ` +
-            `This pure browser version does not include a ZSTD decoder.`
-        );
-    }
-
-
-    return decompressLZ4(
-        data,
-        expectedLength
-    );
-}
-
-
-/*
- * Raw LZ4 block decompressor.
- *
- * RBXM uses raw LZ4 blocks, not LZ4 frames.
- */
-
-function decompressLZ4(
-    input,
-    expectedLength
-) {
-
-    const output =
-        new Uint8Array(
-            expectedLength
-        );
-
-
-    let src = 0;
-
-    let dst = 0;
-
-
-    while (
-        src < input.length
-    ) {
-
-        const token =
-            input[src++];
-
-
-        let literalLength =
-            token >> 4;
-
-
-        if (
-            literalLength === 15
-        ) {
-
-            let value;
-
-            do {
-
-                if (
-                    src >= input.length
-                ) {
-                    throw new Error(
-                        "Invalid LZ4 literal length."
-                    );
-                }
-
-                value =
-                    input[src++];
-
-                literalLength += value;
-
-            } while (
-                value === 255
+        stringFixed(length) {
+            return new TextDecoder("utf-8").decode(
+                this.bytesSlice(length)
             );
         }
 
+        string() {
+            const length = this.u32le();
 
-        if (
-            src + literalLength >
-            input.length
-        ) {
-            throw new Error(
-                "Invalid LZ4 literal block."
-            );
-        }
-
-
-        output.set(
-            input.subarray(
-                src,
-                src + literalLength
-            ),
-            dst
-        );
-
-
-        src += literalLength;
-
-        dst += literalLength;
-
-
-        if (
-            src >= input.length
-        ) {
-            break;
-        }
-
-
-        if (
-            src + 2 >
-            input.length
-        ) {
-            throw new Error(
-                "Invalid LZ4 match offset."
-            );
-        }
-
-
-        const offset =
-            input[src] |
-            (input[src + 1] << 8);
-
-        src += 2;
-
-
-        if (
-            offset === 0 ||
-            offset > dst
-        ) {
-            throw new Error(
-                "Invalid LZ4 match offset."
-            );
-        }
-
-
-        let matchLength =
-            token & 0x0f;
-
-
-        if (
-            matchLength === 15
-        ) {
-
-            let value;
-
-            do {
-
-                if (
-                    src >= input.length
-                ) {
-                    throw new Error(
-                        "Invalid LZ4 match length."
-                    );
-                }
-
-                value =
-                    input[src++];
-
-                matchLength += value;
-
-            } while (
-                value === 255
-            );
-        }
-
-
-        matchLength += 4;
-
-
-        const matchStart =
-            dst - offset;
-
-
-        for (
-            let i = 0;
-            i < matchLength;
-            i++
-        ) {
-
-            if (
-                dst >= output.length
-            ) {
+            if (length > this.remaining) {
                 throw new Error(
-                    "LZ4 decompression exceeded expected size."
+                    `Invalid string length ${length}`
                 );
             }
 
-            output[dst++] =
-                output[
-                    matchStart + i
-                ];
+            return this.stringFixed(length);
+        }
+
+        subReader(length) {
+            const data = this.bytesSlice(length);
+            return new Reader(data.buffer);
         }
     }
 
 
-    if (
-        dst !== expectedLength
-    ) {
-        throw new Error(
-            `LZ4 decompression size mismatch: ` +
-            `${dst} != ${expectedLength}`
-        );
+    // =========================================================
+    // Binary helpers
+    // =========================================================
+
+    function equalBytes(a, b) {
+        if (a.length !== b.length) {
+            return false;
+        }
+
+        for (let i = 0; i < a.length; i++) {
+            if (a[i] !== b[i]) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
 
-    return output;
-}
+    function readInterleavedBytes(reader, count, width) {
+        const result = new Uint8Array(count * width);
+
+        for (let byteIndex = 0; byteIndex < width; byteIndex++) {
+            for (let itemIndex = 0; itemIndex < count; itemIndex++) {
+                result[itemIndex * width + byteIndex] = reader.u8();
+            }
+        }
+
+        return result;
+    }
 
 
-/* =========================================================
- * CHUNK PARSING
- * ======================================================= */
+    function readRobloxFloatFromBytes(bytes, offset) {
+        /*
+         * Roblox float format:
+         *
+         * eeeeeeee mmmmmmmm mmmmmmmm mmmmmmms
+         *
+         * Unlike normal IEEE float:
+         * the sign bit is the LAST bit.
+         */
 
-function parseChunks(
-    chunks,
-    header
-) {
+        const b0 = bytes[offset];
+        const b1 = bytes[offset + 1];
+        const b2 = bytes[offset + 2];
+        const b3 = bytes[offset + 3];
 
-    const classes =
-        new Map();
+        const exponent =
+            ((b0 << 1) | (b1 >> 7)) & 0xff;
 
-    const properties = [];
+        const mantissa =
+            ((b1 & 0x7f) << 16) |
+            (b2 << 8) |
+            (b3 & 0xfe) |
+            ((b3 & 0x01) ? 0 : 0);
 
-    const parents = [];
+        const sign = b3 & 1;
 
-    const metadata = {};
+        // Special values
+        if (exponent === 0xff) {
+            if (mantissa === 0) {
+                return sign ? -Infinity : Infinity;
+            }
 
-    const sharedStrings = [];
+            return NaN;
+        }
 
-    const warnings = [];
+        let value;
 
+        if (exponent === 0) {
+            if (mantissa === 0) {
+                value = 0;
+            } else {
+                value =
+                    (mantissa / 0x800000) *
+                    Math.pow(2, -126);
+            }
+        } else {
+            value =
+                (1 + mantissa / 0x800000) *
+                Math.pow(2, exponent - 127);
+        }
 
-    for (const chunk of chunks) {
-
-        switch (chunk.name) {
-
-            case "META":
-                parseMETA(
-                    chunk.data,
-                    metadata
-                );
-                break;
-
-
-            case "SSTR":
-                parseSSTR(
-                    chunk.data,
-                    sharedStrings
-                );
-                break;
+        return sign ? -value : value;
+    }
 
 
-            case "INST": {
+    function readRobloxFloatArray(reader, count) {
+        const raw = readInterleavedBytes(reader, count, 4);
+        const result = new Array(count);
 
-                const inst =
-                    parseINST(
-                        chunk.data
-                    );
+        for (let i = 0; i < count; i++) {
+            result[i] = readRobloxFloatFromBytes(raw, i * 4);
+        }
 
-                classes.set(
-                    inst.classId,
-                    inst
-                );
+        return result;
+    }
 
+
+    function untransformInt32(value) {
+        // Zig-zag inverse.
+        //
+        // Encoded:
+        // positive x -> 2*x
+        // negative x -> 2*abs(x)-1
+        //
+        // Decode:
+        // even -> x / 2
+        // odd  -> -(x + 1) / 2
+
+        const unsigned = value >>> 0;
+
+        if ((unsigned & 1) === 0) {
+            return unsigned / 2;
+        }
+
+        return -((unsigned + 1) / 2);
+    }
+
+
+    function readInt32Array(reader, count) {
+        const raw = readInterleavedBytes(reader, count, 4);
+        const values = new Array(count);
+
+        for (let i = 0; i < count; i++) {
+            const offset = i * 4;
+
+            const encoded =
+                ((raw[offset] << 24) |
+                 (raw[offset + 1] << 16) |
+                 (raw[offset + 2] << 8) |
+                 raw[offset + 3]) >>> 0;
+
+            values[i] = untransformInt32(encoded);
+        }
+
+        return values;
+    }
+
+
+    function readReferentArray(reader, count) {
+        const deltas = readInt32Array(reader, count);
+
+        const result = new Array(count);
+
+        let previous = 0;
+
+        for (let i = 0; i < count; i++) {
+            previous += deltas[i];
+            result[i] = previous;
+        }
+
+        return result;
+    }
+
+
+    // =========================================================
+    // LZ4 block decompressor
+    // =========================================================
+
+    function lz4Decompress(input, expectedSize) {
+        const output = new Uint8Array(expectedSize);
+
+        let ip = 0;
+        let op = 0;
+
+        while (ip < input.length) {
+
+            const token = input[ip++];
+
+            let literalLength = token >> 4;
+
+            if (literalLength === 15) {
+                let byte;
+
+                do {
+                    if (ip >= input.length) {
+                        throw new Error("Invalid LZ4 literal length");
+                    }
+
+                    byte = input[ip++];
+                    literalLength += byte;
+                } while (byte === 255);
+            }
+
+            if (ip + literalLength > input.length) {
+                throw new Error("Invalid LZ4 literal data");
+            }
+
+            if (op + literalLength > output.length) {
+                throw new Error("LZ4 output overflow");
+            }
+
+            output.set(
+                input.subarray(ip, ip + literalLength),
+                op
+            );
+
+            ip += literalLength;
+            op += literalLength;
+
+            // Last sequence has no match.
+            if (ip >= input.length) {
                 break;
             }
 
+            if (ip + 2 > input.length) {
+                throw new Error("Invalid LZ4 match offset");
+            }
 
-            case "PROP":
+            const matchOffset =
+                input[ip] |
+                (input[ip + 1] << 8);
 
-                properties.push(
-                    parsePROP(
-                        chunk.data,
-                        classes
-                    )
-                );
+            ip += 2;
 
-                break;
+            if (matchOffset === 0 || matchOffset > op) {
+                throw new Error("Invalid LZ4 match offset");
+            }
+
+            let matchLength = token & 0x0f;
+
+            if (matchLength === 15) {
+                let byte;
+
+                do {
+                    if (ip >= input.length) {
+                        throw new Error("Invalid LZ4 match length");
+                    }
+
+                    byte = input[ip++];
+                    matchLength += byte;
+                } while (byte === 255);
+            }
+
+            matchLength += 4;
+
+            if (op + matchLength > output.length) {
+                throw new Error("LZ4 output overflow");
+            }
+
+            for (let i = 0; i < matchLength; i++) {
+                output[op + i] =
+                    output[op - matchOffset + i];
+
+                // Important:
+                // this allows overlapping copies.
+            }
+
+            op += matchLength;
+        }
+
+        if (op !== expectedSize) {
+            throw new Error(
+                `LZ4 size mismatch: expected ${expectedSize}, got ${op}`
+            );
+        }
+
+        return output;
+    }
 
 
-            case "PRNT":
+    // =========================================================
+    // Chunk decompression
+    // =========================================================
 
-                parents.push(
-                    parsePRNT(
-                        chunk.data
-                    )
-                );
+    function readChunk(reader) {
+        const nameBytes = reader.bytesSlice(4);
 
-                break;
+        const name =
+            String.fromCharCode(...nameBytes);
+
+        const compressedLength = reader.u32le();
+        const uncompressedLength = reader.u32le();
+
+        // Reserved.
+        reader.u32le();
+
+        if (compressedLength === 0) {
+            return {
+                name,
+                data: reader.bytesSlice(uncompressedLength)
+            };
+        }
+
+        const compressed =
+            reader.bytesSlice(compressedLength);
+
+        // ZSTD magic:
+        // 28 B5 2F FD
+        if (
+            compressed.length >= 4 &&
+            compressed[0] === 0x28 &&
+            compressed[1] === 0xb5 &&
+            compressed[2] === 0x2f &&
+            compressed[3] === 0xfd
+        ) {
+            throw new Error(
+                "Этот RBXM использует Zstandard (ZSTD). " +
+                "В текущем браузерном декодере ZSTD пока не подключён."
+            );
+        }
+
+        return {
+            name,
+            data: lz4Decompress(
+                compressed,
+                uncompressedLength
+            )
+        };
+    }
 
 
-            case "END":
-                break;
+    // =========================================================
+    // Property values
+    // =========================================================
 
+    function readStringArray(reader, count) {
+        const values = [];
+
+        for (let i = 0; i < count; i++) {
+            values.push(reader.string());
+        }
+
+        return values;
+    }
+
+
+    function readBoolArray(reader, count) {
+        const values = [];
+
+        for (let i = 0; i < count; i++) {
+            values.push(reader.u8() !== 0);
+        }
+
+        return values;
+    }
+
+
+    function readFloat64Array(reader, count) {
+        const values = [];
+
+        for (let i = 0; i < count; i++) {
+            values.push(reader.f64le());
+        }
+
+        return values;
+    }
+
+
+    function readEnumArray(reader, count) {
+        const raw =
+            readInterleavedBytes(reader, count, 4);
+
+        const values = [];
+
+        for (let i = 0; i < count; i++) {
+            const o = i * 4;
+
+            const value =
+                ((raw[o] << 24) |
+                 (raw[o + 1] << 16) |
+                 (raw[o + 2] << 8) |
+                 raw[o + 3]) >>> 0;
+
+            values.push(value);
+        }
+
+        return values;
+    }
+
+
+    function readVector3Array(reader, count) {
+        const x = readRobloxFloatArray(reader, count);
+        const y = readRobloxFloatArray(reader, count);
+        const z = readRobloxFloatArray(reader, count);
+
+        const values = [];
+
+        for (let i = 0; i < count; i++) {
+            values.push({
+                x: x[i],
+                y: y[i],
+                z: z[i]
+            });
+        }
+
+        return values;
+    }
+
+
+    function readCFrameArray(reader, count) {
+        const ids = [];
+
+        const matrices = new Array(count).fill(null);
+
+        const SPECIAL_ROTATIONS = {
+            0x02: [0, 0, 0],
+            0x03: [90, 0, 0],
+            0x05: [0, 180, 180],
+            0x06: [-90, 0, 0],
+            0x07: [0, 180, 90],
+            0x09: [0, 90, 90],
+            0x0a: [0, 0, 90],
+            0x0c: [0, -90, 90],
+            0x0d: [-90, -90, 0],
+            0x0e: [0, -90, 0],
+            0x10: [90, -90, 0],
+            0x11: [0, 90, 180],
+
+            0x14: [0, 180, 0],
+            0x15: [-90, -180, 0],
+            0x17: [0, 0, 180],
+            0x18: [90, 180, 0],
+            0x19: [0, 0, -90],
+            0x1b: [0, -90, -90],
+            0x1c: [0, -180, -90],
+            0x1e: [0, 90, -90],
+            0x1f: [90, 90, 0],
+            0x20: [0, 90, 0],
+            0x22: [-90, 90, 0],
+            0x23: [0, -90, 180]
+        };
+
+        for (let i = 0; i < count; i++) {
+            const id = reader.u8();
+
+            ids.push(id);
+
+            if (id === 0) {
+                const raw =
+                    reader.bytesSlice(9 * 4);
+
+                const matrix = [];
+
+                for (let j = 0; j < 9; j++) {
+                    const o = j * 4;
+
+                    const bytes = raw.subarray(o, o + 4);
+
+                    const temp =
+                        new Uint8Array(bytes).buffer;
+
+                    const view =
+                        new DataView(temp);
+
+                    matrix.push(
+                        view.getFloat32(0, true)
+                    );
+                }
+
+                matrices[i] = matrix;
+            } else {
+                if (!SPECIAL_ROTATIONS[id]) {
+                    throw new Error(
+                        `Unknown CFrame rotation ID: 0x${id.toString(16)}`
+                    );
+                }
+
+                matrices[i] =
+                    SPECIAL_ROTATIONS[id];
+            }
+        }
+
+        // Position is stored AFTER all orientations.
+        const positions =
+            readVector3Array(reader, count);
+
+        const result = [];
+
+        for (let i = 0; i < count; i++) {
+            result.push({
+                position: positions[i],
+                rotation: matrices[i],
+                rotationId: ids[i]
+            });
+        }
+
+        return result;
+    }
+
+
+    function readPropertyValues(reader, typeId, count) {
+
+        switch (typeId) {
+
+            // String
+            case 0x01:
+                return readStringArray(reader, count);
+
+            // Bool
+            case 0x02:
+                return readBoolArray(reader, count);
+
+            // Int32
+            case 0x03:
+                return readInt32Array(reader, count);
+
+            // Float32
+            case 0x04:
+                return readRobloxFloatArray(reader, count);
+
+            // Float64
+            case 0x05:
+                return readFloat64Array(reader, count);
+
+            // Vector2
+            case 0x0d: {
+                const x =
+                    readRobloxFloatArray(reader, count);
+
+                const y =
+                    readRobloxFloatArray(reader, count);
+
+                return x.map((_, i) => ({
+                    x: x[i],
+                    y: y[i]
+                }));
+            }
+
+            // Vector3
+            case 0x0e:
+                return readVector3Array(reader, count);
+
+            // CFrame
+            case 0x10:
+                return readCFrameArray(reader, count);
+
+            // Enum
+            case 0x12:
+                return readEnumArray(reader, count);
+
+            // Referent
+            case 0x13:
+                return readReferentArray(reader, count);
+
+            // Vector3int16
+            case 0x14: {
+                const result = [];
+
+                for (let i = 0; i < count; i++) {
+                    result.push({
+                        x: reader.view.getInt16(reader.offset, true),
+                        y: reader.view.getInt16(reader.offset + 2, true),
+                        z: reader.view.getInt16(reader.offset + 4, true)
+                    });
+
+                    reader.offset += 6;
+                }
+
+                return result;
+            }
+
+            // NumberRange
+            case 0x17: {
+                const result = [];
+
+                for (let i = 0; i < count; i++) {
+                    result.push({
+                        min: reader.f32le(),
+                        max: reader.f32le()
+                    });
+                }
+
+                return result;
+            }
+
+            // Color3uint8
+            case 0x1a: {
+                const r = [];
+                const g = [];
+                const b = [];
+
+                for (let i = 0; i < count; i++) {
+                    r.push(reader.u8());
+                }
+
+                for (let i = 0; i < count; i++) {
+                    g.push(reader.u8());
+                }
+
+                for (let i = 0; i < count; i++) {
+                    b.push(reader.u8());
+                }
+
+                return r.map((_, i) => ({
+                    r: r[i],
+                    g: g[i],
+                    b: b[i]
+                }));
+            }
+
+            // SharedString
+            case 0x1c:
+                return readEnumArray(reader, count);
+
+            // Bytecode
+            case 0x1d:
+                return readStringArray(reader, count);
 
             default:
-
-                warnings.push(
-                    `Unsupported RBXM chunk: ${chunk.name}`
+                throw new Error(
+                    `Unsupported RBXM property type: 0x${typeId.toString(16)}`
                 );
-
-                break;
         }
     }
 
 
-    return {
-        header,
-        classes,
-        properties,
-        parents,
-        metadata,
-        sharedStrings,
-        warnings
-    };
-}
+    // =========================================================
+    // Chunk parsing
+    // =========================================================
 
+    function parseINST(data) {
+        const reader = new Reader(data.buffer);
 
-/* =========================================================
- * META
- * ======================================================= */
+        const classId = reader.u32le();
+        const className = reader.string();
 
-function parseMETA(
-    bytes,
-    metadata
-) {
+        const objectFormat = reader.u8();
 
-    const reader =
-        new BinaryReader(
-            bytes.buffer.slice(
-                bytes.byteOffset,
-                bytes.byteOffset +
-                bytes.byteLength
-            )
-        );
+        const count = reader.u32le();
 
+        const referents =
+            readReferentArray(reader, count);
 
-    const count =
-        reader.u32();
+        // Service marker array.
+        let serviceMarkers = null;
 
+        if (objectFormat === 1) {
+            serviceMarkers = [];
 
-    for (
-        let i = 0;
-        i < count;
-        i++
-    ) {
-
-        const key =
-            readStringValue(reader);
-
-        const value =
-            readStringValue(reader);
-
-        metadata[key] = value;
-    }
-}
-
-
-/* =========================================================
- * SSTR
- * ======================================================= */
-
-function parseSSTR(
-    bytes,
-    sharedStrings
-) {
-
-    const reader =
-        new BinaryReader(
-            bytes.buffer.slice(
-                bytes.byteOffset,
-                bytes.byteOffset +
-                bytes.byteLength
-            )
-        );
-
-
-    reader.u32(); // version
-
-    const count =
-        reader.u32();
-
-
-    for (
-        let i = 0;
-        i < count;
-        i++
-    ) {
-
-        reader.bytesArray(16);
-
-        sharedStrings.push(
-            readStringValue(reader)
-        );
-    }
-}
-
-
-/* =========================================================
- * INST
- * ======================================================= */
-
-function parseINST(bytes) {
-
-    const reader =
-        new BinaryReader(
-            bytes.buffer.slice(
-                bytes.byteOffset,
-                bytes.byteOffset +
-                bytes.byteLength
-            )
-        );
-
-
-    const classId =
-        reader.u32();
-
-
-    const className =
-        readStringValue(reader);
-
-
-    const objectFormat =
-        reader.u8();
-
-
-    const count =
-        reader.u32();
-
-
-    const referents =
-        readInterleavedInt32(
-            reader,
-            count,
-            true
-        );
-
-
-    const serviceMarkers = [];
-
-
-    if (objectFormat === 1) {
-
-        for (
-            let i = 0;
-            i < count;
-            i++
-        ) {
-
-            serviceMarkers.push(
-                reader.u8()
-            );
+            for (let i = 0; i < count; i++) {
+                serviceMarkers.push(reader.u8());
+            }
         }
-    }
 
-
-    return {
-        classId,
-
-        className,
-
-        objectFormat,
-
-        count,
-
-        referents,
-
-        serviceMarkers
-    };
-}
-
-
-/* =========================================================
- * PROP
- * ======================================================= */
-
-function parsePROP(
-    bytes,
-    classes
-) {
-
-    const reader =
-        new BinaryReader(
-            bytes.buffer.slice(
-                bytes.byteOffset,
-                bytes.byteOffset +
-                bytes.byteLength
-            )
-        );
-
-
-    const classId =
-        reader.u32();
-
-
-    const propertyName =
-        readStringValue(reader);
-
-
-    const typeId =
-        reader.u8();
-
-
-    const classInfo =
-        classes.get(classId);
-
-
-    if (!classInfo) {
-
-        throw new Error(
-            `PROP references unknown class ID ${classId}.`
-        );
-    }
-
-
-    const count =
-        classInfo.count;
-
-
-    const values =
-        readPropertyValues(
-            reader,
-            typeId,
-            count
-        );
-
-
-    return {
-        classId,
-
-        className:
-            classInfo.className,
-
-        propertyName,
-
-        typeId,
-
-        values
-    };
-}
-
-
-/* =========================================================
- * PRNT
- * ======================================================= */
-
-function parsePRNT(bytes) {
-
-    const reader =
-        new BinaryReader(
-            bytes.buffer.slice(
-                bytes.byteOffset,
-                bytes.byteOffset +
-                bytes.byteLength
-            )
-        );
-
-
-    const version =
-        reader.u8();
-
-
-    if (version !== 0) {
-
-        throw new Error(
-            `Unsupported PRNT version: ${version}`
-        );
-    }
-
-
-    const count =
-        reader.u32();
-
-
-    const children =
-        readInterleavedInt32(
-            reader,
+        return {
+            classId,
+            className,
+            objectFormat,
             count,
-            true
-        );
-
-
-    const parents =
-        readInterleavedInt32(
-            reader,
-            count,
-            true
-        );
-
-
-    return {
-        children,
-        parents
-    };
-}
-
-
-/* =========================================================
- * INSTANCE TREE
- * ======================================================= */
-
-function buildInstanceTree(parsed) {
-
-    const instances =
-        new Map();
-
-
-    /*
-     * First create all instances.
-     */
-
-    for (
-        const classInfo
-        of parsed.classes.values()
-    ) {
-
-        for (
-            let i = 0;
-            i < classInfo.count;
-            i++
-        ) {
-
-            const referent =
-                classInfo.referents[i];
-
-
-            instances.set(
-                referent,
-                {
-                    referent,
-
-                    classId:
-                        classInfo.classId,
-
-                    className:
-                        classInfo.className,
-
-                    name:
-                        classInfo.className,
-
-                    properties: {},
-
-                    parent: null,
-
-                    children: []
-                }
-            );
-        }
+            referents,
+            serviceMarkers
+        };
     }
 
 
-    /*
-     * Apply properties.
-     */
+    function parsePROP(data, instancesByClassId) {
+        const reader = new Reader(data.buffer);
 
-    for (
-        const prop
-        of parsed.properties
-    ) {
+        const classId = reader.u32le();
+
+        const propertyName = reader.string();
+
+        const typeId = reader.u8();
 
         const classInfo =
-            parsed.classes.get(
-                prop.classId
-            );
-
+            instancesByClassId.get(classId);
 
         if (!classInfo) {
-            continue;
+            throw new Error(
+                `PROP references unknown class ID ${classId}`
+            );
         }
 
+        const values =
+            readPropertyValues(
+                reader,
+                typeId,
+                classInfo.referents.length
+            );
 
-        for (
-            let i = 0;
-            i < prop.values.length;
-            i++
-        ) {
-
-            const referent =
-                classInfo.referents[i];
-
-
-            const instance =
-                instances.get(
-                    referent
-                );
-
-
-            if (!instance) {
-                continue;
-            }
-
-
-            instance.properties[
-                prop.propertyName
-            ] = prop.values[i];
-
-
-            /*
-             * Roblox Instance.Name
-             */
-
-            if (
-                prop.propertyName ===
-                "Name"
-            ) {
-
-                instance.name =
-                    prop.values[i];
-            }
-        }
+        return {
+            classId,
+            propertyName,
+            typeId,
+            values
+        };
     }
 
 
-    /*
-     * Apply parent relationships.
-     */
+    function parsePRNT(data) {
+        const reader = new Reader(data.buffer);
 
-    for (
-        const parentChunk
-        of parsed.parents
-    ) {
+        const version = reader.u8();
 
-        for (
-            let i = 0;
-            i < parentChunk.children.length;
-            i++
-        ) {
+        if (version !== 0) {
+            throw new Error(
+                `Unsupported PRNT version: ${version}`
+            );
+        }
 
-            const childRef =
-                parentChunk.children[i];
+        const count = reader.u32le();
 
-            const parentRef =
-                parentChunk.parents[i];
+        const children =
+            readReferentArray(reader, count);
+
+        const parents =
+            readReferentArray(reader, count);
+
+        return {
+            version,
+            count,
+            children,
+            parents
+        };
+    }
 
 
-            const child =
-                instances.get(
-                    childRef
+    function parseMETA(data) {
+        const reader = new Reader(data.buffer);
+
+        const count = reader.u32le();
+
+        const metadata = {};
+
+        for (let i = 0; i < count; i++) {
+            const key = reader.string();
+            const value = reader.string();
+
+            metadata[key] = value;
+        }
+
+        return metadata;
+    }
+
+
+    // =========================================================
+    // Main decoder
+    // =========================================================
+
+    function parse(arrayBuffer) {
+
+        const reader =
+            new Reader(arrayBuffer);
+
+        // -----------------------------------------------------
+        // Header
+        // -----------------------------------------------------
+
+        const magic =
+            reader.stringFixed(8);
+
+        if (magic !== "<roblox!") {
+            throw new Error(
+                "Файл не является Binary RBXM: неверный magic."
+            );
+        }
+
+        const signature =
+            Array.from(reader.bytesSlice(6));
+
+        const expectedSignature = [
+            0x89,
+            0xff,
+            0x0d,
+            0x0a,
+            0x1a,
+            0x0a
+        ];
+
+        if (!equalBytes(signature, expectedSignature)) {
+            throw new Error(
+                "Неверная сигнатура Binary RBXM."
+            );
+        }
+
+        const version =
+            reader.u16le();
+
+        if (version !== 0) {
+            throw new Error(
+                `Неподдерживаемая версия RBXM: ${version}`
+            );
+        }
+
+        const classCount =
+            reader.i32le();
+
+        const instanceCount =
+            reader.i32le();
+
+        // Reserved 8 bytes.
+        reader.bytesSlice(8);
+
+        const chunks = [];
+
+        const classes =
+            new Map();
+
+        const properties = [];
+
+        let parents = null;
+        let metadata = {};
+
+        // -----------------------------------------------------
+        // Chunks
+        // -----------------------------------------------------
+
+        while (reader.remaining > 0) {
+
+            const chunk =
+                readChunk(reader);
+
+            chunks.push(chunk);
+
+            switch (chunk.name) {
+
+                case "META":
+                    metadata =
+                        parseMETA(chunk.data);
+
+                    break;
+
+                case "INST": {
+                    const inst =
+                        parseINST(chunk.data);
+
+                    if (classes.has(inst.classId)) {
+                        throw new Error(
+                            `Duplicate INST class ID: ${inst.classId}`
+                        );
+                    }
+
+                    classes.set(
+                        inst.classId,
+                        inst
+                    );
+
+                    break;
+                }
+
+                case "PROP":
+                    properties.push(chunk.data);
+                    break;
+
+                case "PRNT":
+                    parents =
+                        parsePRNT(chunk.data);
+
+                    break;
+
+                case "END\0": {
+                    const endReader =
+                        new Reader(chunk.data.buffer);
+
+                    const end =
+                        endReader.stringFixed(
+                            Math.min(9, chunk.data.length)
+                        );
+
+                    if (end !== "</roblox>") {
+                        throw new Error(
+                            "Неверный END chunk RBXM."
+                        );
+                    }
+
+                    break;
+                }
+
+                case "SSTR":
+                    // SharedString пока не нужен
+                    // для нашего animation MVP.
+                    break;
+
+                default:
+                    console.warn(
+                        "Unknown RBXM chunk:",
+                        chunk.name
+                    );
+            }
+
+            if (chunk.name === "END\0") {
+                break;
+            }
+        }
+
+        if (!parents) {
+            throw new Error(
+                "RBXM не содержит PRNT chunk."
+            );
+        }
+
+        // -----------------------------------------------------
+        // Create instances
+        // -----------------------------------------------------
+
+        const instances =
+            new Map();
+
+        for (const instInfo of classes.values()) {
+
+            for (let i = 0; i < instInfo.referents.length; i++) {
+
+                const referent =
+                    instInfo.referents[i];
+
+                instances.set(
+                    referent,
+                    {
+                        referent,
+                        className: instInfo.className,
+                        name: instInfo.className,
+
+                        parent: null,
+                        children: [],
+
+                        properties: {}
+                    }
+                );
+            }
+        }
+
+        // -----------------------------------------------------
+        // Properties
+        // -----------------------------------------------------
+
+        for (const propData of properties) {
+
+            const prop =
+                parsePROP(
+                    propData,
+                    classes
                 );
 
+            const classInfo =
+                classes.get(prop.classId);
+
+            for (let i = 0; i < classInfo.referents.length; i++) {
+
+                const referent =
+                    classInfo.referents[i];
+
+                const instance =
+                    instances.get(referent);
+
+                if (!instance) {
+                    continue;
+                }
+
+                instance.properties[
+                    prop.propertyName
+                ] = prop.values[i];
+
+                // Roblox Name property.
+                if (prop.propertyName === "Name") {
+                    instance.name =
+                        String(prop.values[i]);
+                }
+            }
+        }
+
+        // -----------------------------------------------------
+        // Parent hierarchy
+        // -----------------------------------------------------
+
+        for (let i = 0; i < parents.children.length; i++) {
+
+            const childRef =
+                parents.children[i];
+
+            const parentRef =
+                parents.parents[i];
+
+            const child =
+                instances.get(childRef);
 
             if (!child) {
                 continue;
             }
 
-
-            if (
-                parentRef !== -1
-            ) {
-
-                const parent =
-                    instances.get(
-                        parentRef
-                    );
-
-
-                if (parent) {
-
-                    child.parent =
-                        parent;
-
-                    parent.children.push(
-                        child
-                    );
-                }
-
-            } else {
-
+            if (parentRef === -1) {
                 child.parent = null;
-            }
-        }
-    }
-
-
-    return Array.from(
-        instances.values()
-    );
-}
-
-
-/* =========================================================
- * CHARACTER
- * ======================================================= */
-
-function extractCharacter(
-    instances
-) {
-
-    const models =
-        instances.filter(
-            instance =>
-                instance.className ===
-                "Model"
-        );
-
-
-    const humanoids =
-        instances.filter(
-            instance =>
-                instance.className ===
-                "Humanoid"
-        );
-
-
-    let model = null;
-
-
-    if (humanoids.length > 0) {
-
-        let current =
-            humanoids[0].parent;
-
-
-        while (current) {
-
-            if (
-                current.className ===
-                "Model"
-            ) {
-
-                model = current;
-
-                break;
+                continue;
             }
 
-            current =
-                current.parent;
+            const parent =
+                instances.get(parentRef);
+
+            if (!parent) {
+                continue;
+            }
+
+            child.parent = parent;
+            parent.children.push(child);
         }
-    }
 
+        // -----------------------------------------------------
+        // Roots
+        // -----------------------------------------------------
 
-    if (!model && models.length > 0) {
-        model = models[0];
-    }
+        const roots = [];
 
-
-    if (!model) {
+        for (const instance of instances.values()) {
+            if (instance.parent === null) {
+                roots.push(instance);
+            }
+        }
 
         return {
-            found: false,
+            header: {
+                version,
+                classCount,
+                instanceCount
+            },
 
-            model: null,
+            metadata,
 
-            humanoid: null,
+            classes,
 
-            bodyParts: []
+            instances,
+
+            roots,
+
+            chunks
         };
     }
 
 
-    const humanoid =
-        model.children.find(
-            child =>
-                child.className ===
-                "Humanoid"
-        ) || null;
+    // =========================================================
+    // Utility functions for converter
+    // =========================================================
+
+    function findAll(root, predicate) {
+
+        const result = [];
+
+        function visit(node) {
+
+            if (predicate(node)) {
+                result.push(node);
+            }
+
+            for (const child of node.children) {
+                visit(child);
+            }
+        }
+
+        visit(root);
+
+        return result;
+    }
 
 
-    const bodyParts = [];
+    function findByClass(root, className) {
+        return findAll(
+            root,
+            node => node.className === className
+        );
+    }
 
 
-    for (
-        const child
-        of model.children
-    ) {
+    function findByName(root, name) {
+        return findAll(
+            root,
+            node => node.name === name
+        );
+    }
+
+
+    function getProperty(instance, propertyName, fallback = null) {
+        if (!instance) {
+            return fallback;
+        }
 
         if (
-            isBodyPart(
-                child
+            Object.prototype.hasOwnProperty.call(
+                instance.properties,
+                propertyName
             )
         ) {
+            return instance.properties[propertyName];
+        }
 
-            bodyParts.push(
-                child
-            );
+        return fallback;
+    }
+
+
+    function printTree(root, indent = "") {
+
+        console.log(
+            `${indent}${root.className}: ${root.name}`
+        );
+
+        for (const child of root.children) {
+            printTree(child, indent + "  ");
         }
     }
 
 
-    return {
-        found: true,
+    // =========================================================
+    // Animation extraction
+    // =========================================================
 
-        model,
+    function extractAnimation(root) {
 
-        humanoid,
-
-        bodyParts
-    };
-}
-
-
-/* =========================================================
- * BODY PART DETECTION
- * ======================================================= */
-
-function isBodyPart(
-    instance
-) {
-
-    const className =
-        instance.className;
-
-
-    if (
-        className !== "Part" &&
-        className !== "MeshPart"
-    ) {
-        return false;
-    }
-
-
-    return true;
-}
-
-
-/* =========================================================
- * ANIMATION EXTRACTION
- * ======================================================= */
-
-function extractAnimation(
-    instances
-) {
-
-    const sequences =
-        instances.filter(
-            instance =>
-                instance.className ===
-                "KeyframeSequence"
-        );
-
-
-    if (
-        sequences.length === 0
-    ) {
-
-        return {
-            found: false,
-
-            keyframeSequence: null,
-
-            keyframes: []
+        const result = {
+            keyframeSequences: []
         };
-    }
 
+        const sequences =
+            findAll(
+                root,
+                node =>
+                    node.className === "KeyframeSequence"
+            );
 
-    const sequence =
-        sequences[0];
+        for (const sequence of sequences) {
 
+            const animation = {
+                name: sequence.name,
+                priority: getProperty(
+                    sequence,
+                    "Priority"
+                ),
+                keyframes: []
+            };
 
-    const keyframes =
-        sequence.children
-            .filter(
-                child =>
-                    child.className ===
-                    "Keyframe"
-            )
-            .sort(
+            const keyframes =
+                sequence.children.filter(
+                    child =>
+                        child.className === "Keyframe"
+                );
+
+            keyframes.sort(
                 (a, b) =>
-                    getNumber(
-                        a,
-                        "Time"
+                    Number(
+                        getProperty(a, "Time", 0)
                     ) -
-                    getNumber(
-                        b,
-                        "Time"
+                    Number(
+                        getProperty(b, "Time", 0)
                     )
             );
 
-
-    return {
-        found: true,
-
-        keyframeSequence:
-            sequence,
-
-        keyframes:
-            keyframes.map(
-                extractKeyframe
-            )
-    };
-}
-
-
-/* =========================================================
- * KEYFRAME
- * ======================================================= */
-
-function extractKeyframe(
-    keyframe
-) {
-
-    return {
-        referent:
-            keyframe.referent,
-
-        name:
-            getProperty(
-                keyframe,
-                "Name",
-                ""
-            ),
-
-        time:
-            getNumber(
-                keyframe,
-                "Time"
-            ),
-
-        poses:
-            keyframe.children
-                .filter(
-                    child =>
-                        child.className ===
-                        "Pose"
-                )
-                .map(
-                    extractPose
-                )
-    };
-}
-
-
-/* =========================================================
- * POSE
- * ======================================================= */
-
-function extractPose(
-    pose
-) {
-
-    return {
-        referent:
-            pose.referent,
-
-        name:
-            getProperty(
-                pose,
-                "Name",
-                ""
-            ),
-
-        cframe:
-            getProperty(
-                pose,
-                "CFrame",
-                null
-            ),
-
-        easingStyle:
-            getProperty(
-                pose,
-                "EasingStyle",
-                null
-            ),
-
-        easingDirection:
-            getProperty(
-                pose,
-                "EasingDirection",
-                null
-            ),
-
-        weight:
-            getNumber(
-                pose,
-                "Weight",
-                1
-            ),
-
-        maskWeight:
-            getNumber(
-                pose,
-                "MaskWeight",
-                1
-            ),
-
-        poses:
-            pose.children
-                .filter(
-                    child =>
-                        child.className ===
-                        "Pose"
-                )
-                .map(
-                    extractPose
-                )
-    };
-}
-
-
-/* =========================================================
- * PROPERTY HELPERS
- * ======================================================= */
-
-function getProperty(
-    instance,
-    name,
-    fallback
-) {
-
-    if (
-        Object.prototype.hasOwnProperty.call(
-            instance.properties,
-            name
-        )
-    ) {
-
-        return instance.properties[name];
-    }
-
-
-    return fallback;
-}
-
-
-function getNumber(
-    instance,
-    name,
-    fallback = 0
-) {
-
-    const value =
-        getProperty(
-            instance,
-            name,
-            fallback
-        );
-
-
-    return typeof value === "number"
-        ? value
-        : fallback;
-}
-
-
-/* =========================================================
- * PROPERTY DECODING
- * ======================================================= */
-
-function readPropertyValues(
-    reader,
-    typeId,
-    count
-) {
-
-    switch (typeId) {
-
-        case 0x01:
-            return readStrings(
-                reader,
-                count
-            );
-
-
-        case 0x02:
-            return readBools(
-                reader,
-                count
-            );
-
-
-        case 0x03:
-            return readInterleavedInt32(
-                reader,
-                count,
-                false
-            );
-
-
-        case 0x04:
-            return readRobloxFloat32Array(
-                reader,
-                count
-            );
-
-
-        case 0x05:
-            return readFloat64Array(
-                reader,
-                count
-            );
-
-
-        case 0x0b:
-            return readInterleavedUint32(
-                reader,
-                count
-            );
-
-
-        case 0x0c:
-            return readColor3Array(
-                reader,
-                count
-            );
-
-
-        case 0x0f:
-            return readCFrameArray(
-                reader,
-                count
-            );
-
-
-        case 0x12:
-            return readInterleavedUint32(
-                reader,
-                count
-            );
-
-
-        case 0x13:
-            return readInterleavedInt32(
-                reader,
-                count,
-                true
-            );
-
-
-        case 0x14:
-            return readVector3Int16Array(
-                reader,
-                count
-            );
-
-
-        case 0x16:
-            return readNumberRangeArray(
-                reader,
-                count
-            );
-
-
-        case 0x18:
-            return readRectArray(
-                reader,
-                count
-            );
-
-
-        case 0x1a:
-            return readColor3Uint8Array(
-                reader,
-                count
-            );
-
-
-        case 0x1c:
-            return readSharedStringIndices(
-                reader,
-                count
-            );
-
-
-        case 0x1e:
-            return readOptionalCFrameArray(
-                reader,
-                count
-            );
-
-
-        case 0x1f:
-            return readUniqueIdArray(
-                reader,
-                count
-            );
-
-
-        case 0x20:
-            return readFontArray(
-                reader,
-                count
-            );
-
-
-        case 0x22:
-            return readContentArray(
-                reader,
-                count
-            );
-
-
-        default:
-
-            throw new Error(
-                `Unsupported RBXM property type 0x${typeId.toString(16)}.`
-            );
-    }
-}
-
-
-/* =========================================================
- * STRING
- * ======================================================= */
-
-function readStringValue(
-    reader
-) {
-
-    const length =
-        reader.u32();
-
-    return reader.string(
-        length
-    );
-}
-
-
-function readStrings(
-    reader,
-    count
-) {
-
-    const result = [];
-
-    for (
-        let i = 0;
-        i < count;
-        i++
-    ) {
-
-        result.push(
-            readStringValue(
-                reader
-            )
-        );
-    }
-
-    return result;
-}
-
-
-/* =========================================================
- * BOOL
- * ======================================================= */
-
-function readBools(
-    reader,
-    count
-) {
-
-    const result = [];
-
-    for (
-        let i = 0;
-        i < count;
-        i++
-    ) {
-
-        result.push(
-            reader.u8() !== 0
-        );
-    }
-
-    return result;
-}
-
-
-/* =========================================================
- * INTEGER ARRAYS
- * ======================================================= */
-
-function readInterleavedInt32(
-    reader,
-    count,
-    accumulate
-) {
-
-    const bytes =
-        reader.bytesArray(
-            count * 4
-        );
-
-
-    const values =
-        decodeInterleaved32(
-            bytes,
-            count
-        );
-
-
-    const result = [];
-
-
-    let previous = 0;
-
-
-    for (
-        let i = 0;
-        i < count;
-        i++
-    ) {
-
-        const transformed =
-            values[i];
-
-
-        const value =
-            untransformInt32(
-                transformed
-            );
-
-
-        if (accumulate) {
-
-            previous =
-                (previous + value)
-                | 0;
-
-            result.push(
-                previous
-            );
-
-        } else {
-
-            result.push(
-                value
-            );
-        }
-    }
-
-
-    return result;
-}
-
-
-function readInterleavedUint32(
-    reader,
-    count
-) {
-
-    const bytes =
-        reader.bytesArray(
-            count * 4
-        );
-
-
-    const values =
-        decodeInterleaved32(
-            bytes,
-            count
-        );
-
-
-    return values.map(
-        value =>
-            value >>> 0
-    );
-}
-
-
-function decodeInterleaved32(
-    bytes,
-    count
-) {
-
-    const result =
-        new Array(count);
-
-
-    for (
-        let i = 0;
-        i < count;
-        i++
-    ) {
-
-        const b0 =
-            bytes[i];
-
-
-        const b1 =
-            bytes[count + i];
-
-
-        const b2 =
-            bytes[count * 2 + i];
-
-
-        const b3 =
-            bytes[count * 3 + i];
-
-
-        result[i] =
-            (
-                (b0 << 24) |
-                (b1 << 16) |
-                (b2 << 8) |
-                b3
-            );
-    }
-
-
-    return result;
-}
-
-
-function untransformInt32(
-    value
-) {
-
-    return (
-        value >>> 1
-    ) ^
-    -(
-        value & 1
-    );
-}
-
-
-/* =========================================================
- * FLOAT32
- * ======================================================= */
-
-function readRobloxFloat32Array(
-    reader,
-    count
-) {
-
-    const bytes =
-        reader.bytesArray(
-            count * 4
-        );
-
-
-    const result =
-        new Array(count);
-
-
-    for (
-        let i = 0;
-        i < count;
-        i++
-    ) {
-
-        const b0 =
-            bytes[i];
-
-
-        const b1 =
-            bytes[count + i];
-
-
-        const b2 =
-            bytes[count * 2 + i];
-
-
-        const b3 =
-            bytes[count * 3 + i];
-
-
-        const encoded =
-            (
-                (b0 << 24) |
-                (b1 << 16) |
-                (b2 << 8) |
-                b3
-            ) >>> 0;
-
-
-        result[i] =
-            decodeRobloxFloat(
-                encoded
-            );
-    }
-
-
-    return result;
-}
-
-
-function decodeRobloxFloat(
-    bits
-) {
-
-    const sign =
-        bits & 1;
-
-
-    const exponent =
-        (bits >>> 24) & 0xff;
-
-
-    const mantissa =
-        (bits >>> 1) & 0x7fffff;
-
-
-    const standardBits =
-        (
-            (sign << 31) |
-            (exponent << 23) |
-            mantissa
-        ) >>> 0;
-
-
-    const buffer =
-        new ArrayBuffer(4);
-
-
-    const view =
-        new DataView(buffer);
-
-
-    view.setUint32(
-        0,
-        standardBits,
-        false
-    );
-
-
-    return view.getFloat32(
-        0,
-        false
-    );
-}
-
-
-/* =========================================================
- * FLOAT64
- * ======================================================= */
-
-function readFloat64Array(
-    reader,
-    count
-) {
-
-    const result = [];
-
-    for (
-        let i = 0;
-        i < count;
-        i++
-    ) {
-
-        result.push(
-            reader.f64()
-        );
-    }
-
-    return result;
-}
-
-
-/* =========================================================
- * VECTOR3 INT16
- * ======================================================= */
-
-function readVector3Int16Array(
-    reader,
-    count
-) {
-
-    const result = [];
-
-    for (
-        let i = 0;
-        i < count;
-        i++
-    ) {
-
-        result.push({
-            x: reader.i16(),
-            y: reader.i16(),
-            z: reader.i16()
-        });
-    }
-
-    return result;
-}
-
-
-/* =========================================================
- * COLOR3
- * ======================================================= */
-
-function readColor3Array(
-    reader,
-    count
-) {
-
-    const r =
-        readRobloxFloat32Array(
-            reader,
-            count
-        );
-
-
-    const g =
-        readRobloxFloat32Array(
-            reader,
-            count
-        );
-
-
-    const b =
-        readRobloxFloat32Array(
-            reader,
-            count
-        );
-
-
-    const result = [];
-
-
-    for (
-        let i = 0;
-        i < count;
-        i++
-    ) {
-
-        result.push({
-            r: r[i],
-            g: g[i],
-            b: b[i]
-        });
-    }
-
-
-    return result;
-}
-
-
-/* =========================================================
- * CFRAME
- * ======================================================= */
-
-function readCFrameArray(
-    reader,
-    count
-) {
-
-    /*
-     * CFrame:
-     *
-     * position: Vector3
-     * rotation: compressed orientation matrix
-     *
-     * Roblox stores a CFrame using a special
-     * rotation encoding.
-     *
-     * The animation converter needs the actual
-     * position + rotation matrix.
-     */
-
-    const result = [];
-
-
-    /*
-     * Position is stored as three interleaved
-     * Roblox float arrays.
-     */
-
-    const x =
-        readRobloxFloat32Array(
-            reader,
-            count
-        );
-
-
-    const y =
-        readRobloxFloat32Array(
-            reader,
-            count
-        );
-
-
-    const z =
-        readRobloxFloat32Array(
-            reader,
-            count
-        );
-
-
-    /*
-     * Rotation type is stored separately.
-     *
-     * The Roblox CFrame format uses a byte
-     * orientation identifier followed by
-     * orientation data.
-     *
-     * For animation conversion we preserve
-     * the encoded rotation data.
-     */
-
-    for (
-        let i = 0;
-        i < count;
-        i++
-    ) {
-
-        result.push({
-            position: {
-                x: x[i],
-                y: y[i],
-                z: z[i]
-            },
-
-            rotation: readCFrameRotation(
-                reader
-            )
-        });
-    }
-
-
-    return result;
-}
-
-
-/*
- * CFrame rotation decoder.
- *
- * Roblox stores the rotation as a special
- * orientation code followed by the relevant
- * matrix values.
- */
-
-function readCFrameRotation(
-    reader
-) {
-
-    const code =
-        reader.u8();
-
-
-    /*
-     * The most common CFrame representation
-     * uses a compressed orientation code.
-     *
-     * We decode the common Roblox basis
-     * orientations and preserve unknown
-     * representations.
-     */
-
-    if (code <= 0x23) {
-
-        const basis =
-            cframeBasisFromCode(
-                code
-            );
-
-
-        if (basis) {
-            return basis;
-        }
-    }
-
-
-    /*
-     * Fallback: preserve the code.
-     */
-
-    return {
-        type: "encoded",
-        code
-    };
-}
-
-
-/*
- * Roblox has a fixed table of orthogonal
- * orientations for the compressed CFrame form.
- */
-
-function cframeBasisFromCode(
-    code
-) {
-
-    /*
-     * This table represents the 36 possible
-     * axis-aligned orientations.
-     *
-     * Each matrix is:
-     *
-     * [ X.X X.Y X.Z
-     *   Y.X Y.Y Y.Z
-     *   Z.X Z.Y Z.Z ]
-     */
-
-    const table = [
-
-        [1,0,0, 0,1,0, 0,0,1],
-        [1,0,0, 0,0,-1, 0,1,0],
-        [1,0,0, 0,-1,0, 0,0,-1],
-        [1,0,0, 0,0,1, 0,-1,0],
-
-        [-1,0,0, 0,1,0, 0,0,-1],
-        [-1,0,0, 0,0,-1, 0,-1,0],
-        [-1,0,0, 0,-1,0, 0,0,1],
-        [-1,0,0, 0,0,1, 0,1,0],
-
-        [0,1,0, 1,0,0, 0,0,-1],
-        [0,1,0, 0,0,-1, -1,0,0],
-        [0,1,0, -1,0,0, 0,0,1],
-        [0,1,0, 0,0,1, 1,0,0],
-
-        [0,-1,0, 1,0,0, 0,0,1],
-        [0,-1,0, 0,0,-1, 1,0,0],
-        [0,-1,0, -1,0,0, 0,0,-1],
-        [0,-1,0, 0,0,1, -1,0,0],
-
-        [0,0,1, 1,0,0, 0,1,0],
-        [0,0,1, 0,1,0, -1,0,0],
-        [0,0,1, -1,0,0, 0,-1,0],
-        [0,0,1, 0,-1,0, 1,0,0],
-
-        [0,0,-1, 1,0,0, 0,-1,0],
-        [0,0,-1, 0,1,0, 1,0,0],
-        [0,0,-1, -1,0,0, 0,1,0],
-        [0,0,-1, 0,-1,0, -1,0,0]
-    ];
-
-
-    if (
-        code < table.length
-    ) {
-
-        const m =
-            table[code];
-
-
-        return {
-            type: "matrix",
-
-            x: [m[0], m[1], m[2]],
-
-            y: [m[3], m[4], m[5]],
-
-            z: [m[6], m[7], m[8]]
-        };
-    }
-
-
-    return null;
-}
-
-
-/* =========================================================
- * NUMBER RANGE
- * ======================================================= */
-
-function readNumberRangeArray(
-    reader,
-    count
-) {
-
-    const result = [];
-
-    for (
-        let i = 0;
-        i < count;
-        i++
-    ) {
-
-        result.push({
-            min: reader.f32(),
-            max: reader.f32()
-        });
-    }
-
-    return result;
-}
-
-
-/* =========================================================
- * RECT
- * ======================================================= */
-
-function readRectArray(
-    reader,
-    count
-) {
-
-    const result = [];
-
-    for (
-        let i = 0;
-        i < count;
-        i++
-    ) {
-
-        result.push({
-            min: {
-                x: reader.f32(),
-                y: reader.f32()
-            },
-
-            max: {
-                x: reader.f32(),
-                y: reader.f32()
+            for (const keyframe of keyframes) {
+
+                const frame = {
+                    time: Number(
+                        getProperty(
+                            keyframe,
+                            "Time",
+                            0
+                        )
+                    ),
+
+                    poses: []
+                };
+
+                const poses =
+                    findAll(
+                        keyframe,
+                        node =>
+                            node.className === "Pose"
+                    );
+
+                for (const pose of poses) {
+
+                    frame.poses.push({
+                        name: pose.name,
+
+                        cframe: getProperty(
+                            pose,
+                            "CFrame"
+                        ),
+
+                        easingStyle:
+                            getProperty(
+                                pose,
+                                "EasingStyle"
+                            ),
+
+                        easingDirection:
+                            getProperty(
+                                pose,
+                                "EasingDirection"
+                            ),
+
+                        weight:
+                            getProperty(
+                                pose,
+                                "Weight"
+                            ),
+
+                        maskWeight:
+                            getProperty(
+                                pose,
+                                "MaskWeight"
+                            )
+                    });
+                }
+
+                animation.keyframes.push(frame);
             }
-        });
-    }
 
-    return result;
-}
+            result.keyframeSequences.push(
+                animation
+            );
+        }
 
-
-/* =========================================================
- * COLOR3UINT8
- * ======================================================= */
-
-function readColor3Uint8Array(
-    reader,
-    count
-) {
-
-    const r =
-        reader.bytesArray(count);
-
-    const g =
-        reader.bytesArray(count);
-
-    const b =
-        reader.bytesArray(count);
-
-
-    const result = [];
-
-
-    for (
-        let i = 0;
-        i < count;
-        i++
-    ) {
-
-        result.push({
-            r: r[i],
-            g: g[i],
-            b: b[i]
-        });
+        return result;
     }
 
 
-    return result;
-}
+    // =========================================================
+    // Public API
+    // =========================================================
 
+    return {
+        parse,
 
-/* =========================================================
- * SHARED STRING
- * ======================================================= */
+        findAll,
+        findByClass,
+        findByName,
 
-function readSharedStringIndices(
-    reader,
-    count
-) {
+        getProperty,
 
-    return readInterleavedUint32(
-        reader,
-        count
-    );
-}
+        printTree,
 
+        extractAnimation
+    };
 
-/* =========================================================
- * OPTIONAL CFRAME
- * ======================================================= */
+})();
 
-function readOptionalCFrameArray(
-    reader,
-    count
-) {
 
-    /*
-     * OptionalCoordinateFrame begins with
-     * the CFrame type identifier.
-     */
-
-    const type =
-        reader.u8();
-
-
-    if (type !== 0x0f) {
-
-        throw new Error(
-            "Invalid OptionalCoordinateFrame."
-        );
-    }
-
-
-    const values =
-        readCFrameArray(
-            reader,
-            count
-        );
-
-
-    const boolType =
-        reader.u8();
-
-
-    if (boolType !== 0x02) {
-
-        throw new Error(
-            "Invalid OptionalCoordinateFrame boolean array."
-        );
-    }
-
-
-    const present =
-        readBools(
-            reader,
-            count
-        );
-
-
-    return values.map(
-        (value, i) =>
-            present[i]
-                ? value
-                : null
-    );
-}
-
-
-/* =========================================================
- * UNIQUE ID
- * ======================================================= */
-
-function readUniqueIdArray(
-    reader,
-    count
-) {
-
-    const result = [];
-
-
-    for (
-        let i = 0;
-        i < count;
-        i++
-    ) {
-
-        const index =
-            reader.u32();
-
-
-        const time =
-            reader.u32();
-
-
-        const randomLow =
-            reader.u32();
-
-
-        const randomHigh =
-            reader.i32();
-
-
-        result.push({
-            index,
-            time,
-            randomLow,
-            randomHigh
-        });
-    }
-
-
-    return result;
-}
-
-
-/* =========================================================
- * FONT
- * ======================================================= */
-
-function readFontArray(
-    reader,
-    count
-) {
-
-    const result = [];
-
-
-    for (
-        let i = 0;
-        i < count;
-        i++
-    ) {
-
-        result.push({
-            family:
-                readStringValue(reader),
-
-            cachedFaceId:
-                readStringValue(reader),
-
-            weight:
-                reader.u16(),
-
-            style:
-                reader.u8()
-        });
-    }
-
-
-    return result;
-}
-
-
-/* =========================================================
- * CONTENT
- * ======================================================= */
-
-function readContentArray(
-    reader,
-    count
-) {
-
-    const result = [];
-
-
-    for (
-        let i = 0;
-        i < count;
-        i++
-    ) {
-
-        result.push(
-            readStringValue(
-                reader
-            )
-        );
-    }
-
-
-    return result;
-}
-
-
-/* =========================================================
- * GLOBAL EXPORT
- * ======================================================= */
-
-if (
-    typeof window !==
-    "undefined"
-) {
-
-    window.parseRBXM =
-        parseRBXM;
-
-    window.parseRBXMBuffer =
-        parseRBXMBuffer;
-}
+// Global browser API.
+window.RBXM = RBXM;

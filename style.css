@@ -1,29 +1,32 @@
 body {
-    font-family: sans-serif;
+    font-family: Arial, sans-serif;
+    padding: 30px;
 }
 
-main {
-    max-width: 900px;
-    margin: 40px auto;
+#output {
+    margin-top: 20px;
+    padding: 15px;
+    background: #f0f0f0;
+    border-radius: 8px;
 }
 
-section {
-    margin-bottom: 20px;
+#tree {
+    margin-top: 20px;
+    font-family: monospace;
 }
 
-textarea {
-    display: block;
-    width: 100%;
-    box-sizing: border-box;
-    resize: vertical;
+.rbxm-tree-node {
+    margin-left: 20px;
 }
 
-label {
-    display: block;
-    margin-bottom: 8px;
+.rbxm-tree-line {
+    padding: 3px 0;
 }
 
-input,
-button {
-    margin: 4px;
+.rbxm-tree-line:hover {
+    background: #e8e8e8;
+}
+
+.rbxm-tree-children {
+    margin-left: 20px;
 }

@@ -1,600 +1,120 @@
-import { detectFormat } from "./format.js";
+// js/app.js
 
-import {
-    decompressZstd,
-    compressZstd
-} from "./zstd.js";
+"use strict";
 
-import { parseRBXM } from "./rbxm.js";
+const fileInput = document.getElementById("rbxmFile");
+const output = document.getElementById("output");
+const tree = document.getElementById("tree");
 
+if (!fileInput) {
+    console.error("Не найден input #rbxmFile");
+}
 
-const rbxmInput =
-    document.getElementById("rbxmInput");
+fileInput?.addEventListener("change", async (event) => {
 
-const sourceInput =
-    document.getElementById("sourceInput");
-
-const offsetXInput =
-    document.getElementById("offsetX");
-
-const offsetYInput =
-    document.getElementById("offsetY");
-
-const offsetZInput =
-    document.getElementById("offsetZ");
-
-const convertButton =
-    document.getElementById("convertButton");
-
-const copyButton =
-    document.getElementById("copyButton");
-
-const outputInput =
-    document.getElementById("outputInput");
-
-const status =
-    document.getElementById("status");
-
-
-// ============================================================
-// RBXM file selection
-// ============================================================
-
-rbxmInput.addEventListener(
-    "change",
-    handleRBXMSelection
-);
-
-
-// ============================================================
-// Convert button
-// ============================================================
-
-convertButton.addEventListener(
-    "click",
-    convert
-);
-
-
-// ============================================================
-// Copy button
-// ============================================================
-
-copyButton.addEventListener(
-    "click",
-    async () => {
-
-        if (!outputInput.value) {
-            return;
-        }
-
-        try {
-            await navigator.clipboard.writeText(
-                outputInput.value
-            );
-
-            setStatus("Copied.");
-        }
-
-        catch (error) {
-            console.error(error);
-
-            setStatus(
-                "Unable to copy result."
-            );
-        }
-    }
-);
-
-
-// ============================================================
-// RBXM selection
-// ============================================================
-
-async function handleRBXMSelection() {
-
-    const file =
-        rbxmInput.files[0];
+    const file = event.target.files[0];
 
     if (!file) {
         return;
     }
 
-    try {
-        setStatus(
-            "Reading RBXM..."
-        );
+    output.textContent = "Читаю RBXM...";
 
-        const rbxm =
-            await parseRBXM(file);
-
-        showRBXMInfo(rbxm);
-
-        setStatus(
-            "RBXM loaded successfully."
-        );
-    }
-
-    catch (error) {
-        console.error(error);
-
-        setStatus(
-            `RBXM error: ${error.message}`
-        );
-    }
-}
-
-
-// ============================================================
-// Display RBXM information
-// ============================================================
-
-function showRBXMInfo(rbxm) {
-
-    console.log(
-        "========== RBXM =========="
-    );
-
-    console.log(
-        "Model:",
-        rbxm.model
-    );
-
-    console.log(
-        "Humanoid:",
-        rbxm.humanoid
-    );
-
-    console.log(
-        "KeyframeSequence:",
-        rbxm.keyframeSequence
-    );
-
-    console.log(
-        "Keyframes:",
-        rbxm.keyframes
-    );
-
-    console.log(
-        "Pose count:",
-        rbxm.poses.length
-    );
-
-    console.log(
-        "All instances:",
-        rbxm.instances
-    );
-
-    console.log(
-        "=========================="
-    );
-
-    const modelName =
-        rbxm.model?.name ??
-        "(not found)";
-
-    const humanoidName =
-        rbxm.humanoid?.name ??
-        "(not found)";
-
-    const sequenceName =
-        rbxm.keyframeSequence?.name ??
-        "(not found)";
-
-    const keyframeCount =
-        rbxm.keyframes.length;
-
-    const poseCount =
-        rbxm.poses.length;
-
-    setStatus(
-        [
-            "RBXM loaded.",
-            `Model: ${modelName}`,
-            `Humanoid: ${humanoidName}`,
-            `KeyframeSequence: ${sequenceName}`,
-            `Keyframes: ${keyframeCount}`,
-            `Poses: ${poseCount}`
-        ].join(" | ")
-    );
-}
-
-
-// ============================================================
-// Main conversion
-// ============================================================
-
-async function convert() {
+    tree.innerHTML = "";
 
     try {
 
-        // ----------------------------------------------------
-        // 1. RBXM
-        // ----------------------------------------------------
+        const buffer = await file.arrayBuffer();
 
-        const rbxmFile =
-            rbxmInput.files[0];
+        console.log("RBXM file:", file.name);
+        console.log("Size:", buffer.byteLength);
 
-        if (!rbxmFile) {
-            throw new Error(
-                "Please select an RBXM file."
+        const result = RBXM.parse(buffer);
+
+        console.log("RBXM parsed:", result);
+
+        output.textContent =
+            `Файл: ${file.name}\n` +
+            `Размер: ${buffer.byteLength} байт\n` +
+            `Instances: ${result.instances.size}\n` +
+            `Корневых объектов: ${result.roots.length}`;
+
+        // -------------------------------------------------
+        // Показываем дерево
+        // -------------------------------------------------
+
+        for (const root of result.roots) {
+            tree.appendChild(
+                createTreeElement(root)
             );
         }
 
-        setStatus(
-            "Reading RBXM..."
-        );
+        // -------------------------------------------------
+        // Ищем анимации
+        // -------------------------------------------------
 
-        const rbxm =
-            await parseRBXM(
-                rbxmFile
+        const animation =
+            RBXM.extractAnimation(
+                result.roots[0]
             );
-
-
-        // ----------------------------------------------------
-        // 2. Source text
-        // ----------------------------------------------------
-
-        const source =
-            sourceInput.value.trim();
-
-        if (!source) {
-            throw new Error(
-                "Please enter JSON or Zstandard Base64."
-            );
-        }
-
-
-        // ----------------------------------------------------
-        // 3. Detect format
-        // ----------------------------------------------------
-
-        const format =
-            detectFormat(source);
 
         console.log(
-            "Detected format:",
-            format
+            "Extracted animation:",
+            animation
         );
 
-
-        // ----------------------------------------------------
-        // 4. Convert input to JSON
-        // ----------------------------------------------------
-
-        let inputJSON;
-
-        if (format === "json") {
-
-            inputJSON =
-                JSON.parse(source);
-        }
-
-        else if (
-            format === "zstd-base64"
-        ) {
-
-            inputJSON =
-                await decodeZstdBase64(
-                    source
-                );
-        }
-
-        else {
-
-            throw new Error(
-                "Unsupported input format."
-            );
-        }
-
-
-        // ----------------------------------------------------
-        // 5. Read animation offset
-        // ----------------------------------------------------
-
-        const offset = {
-            x: readNumber(
-                offsetXInput.value
-            ),
-
-            y: readNumber(
-                offsetYInput.value
-            ),
-
-            z: readNumber(
-                offsetZInput.value
-            )
-        };
-
-
-        // ----------------------------------------------------
-        // 6. Convert animation
-        // ----------------------------------------------------
-
-        setStatus(
-            "Converting animation..."
-        );
-
-        const resultJSON =
-            convertAnimation(
-                rbxm,
-                inputJSON,
-                offset
-            );
-
-
-        // ----------------------------------------------------
-        // 7. JSON → UTF-8
-        // ----------------------------------------------------
-
-        const resultText =
-            JSON.stringify(
-                resultJSON
-            );
-
-        const encoder =
-            new TextEncoder();
-
-        const jsonBytes =
-            encoder.encode(
-                resultText
-            );
-
-
-        // ----------------------------------------------------
-        // 8. UTF-8 → Zstandard
-        // ----------------------------------------------------
-
-        setStatus(
-            "Compressing result..."
-        );
-
-        const compressed =
-            await compressZstd(
-                jsonBytes
-            );
-
-
-        // ----------------------------------------------------
-        // 9. Zstandard → Base64
-        // ----------------------------------------------------
-
-        const base64 =
-            bytesToBase64(
-                compressed
-            );
-
-        outputInput.value =
-            base64;
-
-
-        // ----------------------------------------------------
-        // 10. Finished
-        // ----------------------------------------------------
-
-        setStatus(
-            "Conversion completed."
-        );
-
-    }
-
-    catch (error) {
+    } catch (error) {
 
         console.error(error);
 
-        setStatus(
-            `Error: ${error.message}`
-        );
+        output.textContent =
+            "Ошибка:\n" +
+            error.message;
+
     }
-}
+});
 
 
-// ============================================================
-// Zstandard Base64 → JSON
-// ============================================================
+// =========================================================
+// Создание дерева
+// =========================================================
 
-async function decodeZstdBase64(
-    base64
-) {
+function createTreeElement(instance) {
 
-    const compressed =
-        base64ToBytes(
-            base64
-        );
+    const container =
+        document.createElement("div");
 
-    const decompressed =
-        await decompressZstd(
-            compressed
-        );
+    container.className =
+        "rbxm-tree-node";
 
-    const decoder =
-        new TextDecoder();
+    const line =
+        document.createElement("div");
 
-    const jsonText =
-        decoder.decode(
-            decompressed
-        );
+    line.className =
+        "rbxm-tree-line";
 
-    try {
-        return JSON.parse(
-            jsonText
-        );
-    }
+    line.textContent =
+        `${instance.className}  |  ${instance.name}`;
 
-    catch {
-        throw new Error(
-            "Zstandard data was decompressed, " +
-            "but the result is not valid JSON."
-        );
-    }
-}
+    container.appendChild(line);
 
+    if (instance.children.length > 0) {
 
-// ============================================================
-// Animation conversion
-// ============================================================
+        const children =
+            document.createElement("div");
 
-function convertAnimation(
-    rbxm,
-    inputJSON,
-    offset
-) {
+        children.className =
+            "rbxm-tree-children";
 
-    /*
-     * IMPORTANT:
-     *
-     * This is intentionally not the final
-     * JJS conversion yet.
-     *
-     * At this stage we have successfully
-     * connected:
-     *
-     * RBXM
-     *   ↓
-     * Model
-     *   ↓
-     * Humanoid
-     *   ↓
-     * KeyframeSequence
-     *   ↓
-     * Keyframe
-     *   ↓
-     * Pose
-     *
-     * The actual JJS block generation
-     * will be implemented next.
-     */
+        for (const child of instance.children) {
 
-
-    console.log(
-        "========== CONVERSION =========="
-    );
-
-    console.log(
-        "RBXM:",
-        rbxm
-    );
-
-    console.log(
-        "Input JSON:",
-        inputJSON
-    );
-
-    console.log(
-        "Animation offset:",
-        offset
-    );
-
-    console.log(
-        "Keyframes:",
-        rbxm.keyframes
-    );
-
-    console.log(
-        "================================"
-    );
-
-
-    /*
-     * Temporary result.
-     *
-     * For now we preserve the input JSON.
-     * The next conversion stage will replace
-     * this with generated JJS animation data.
-     */
-
-    return inputJSON;
-}
-
-
-// ============================================================
-// Base64
-// ============================================================
-
-function bytesToBase64(
-    bytes
-) {
-
-    let binary = "";
-
-    const chunkSize =
-        0x8000;
-
-    for (
-        let i = 0;
-        i < bytes.length;
-        i += chunkSize
-    ) {
-
-        const chunk =
-            bytes.subarray(
-                i,
-                Math.min(
-                    i + chunkSize,
-                    bytes.length
-                )
+            children.appendChild(
+                createTreeElement(child)
             );
+        }
 
-        binary +=
-            String.fromCharCode(
-                ...chunk
-            );
+        container.appendChild(children);
     }
 
-    return btoa(binary);
-}
-
-
-function base64ToBytes(
-    base64
-) {
-
-    const binary =
-        atob(base64);
-
-    const bytes =
-        new Uint8Array(
-            binary.length
-        );
-
-    for (
-        let i = 0;
-        i < binary.length;
-        i++
-    ) {
-
-        bytes[i] =
-            binary.charCodeAt(i);
-    }
-
-    return bytes;
-}
-
-
-// ============================================================
-// Number
-// ============================================================
-
-function readNumber(value) {
-
-    const number =
-        Number(value);
-
-    if (!Number.isFinite(number)) {
-        return 0;
-    }
-
-    return number;
-}
-
-
-// ============================================================
-// Status
-// ============================================================
-
-function setStatus(
-    message
-) {
-    status.textContent =
-        message;
+    return container;
 }
