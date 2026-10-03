@@ -6,6 +6,8 @@ const fileInput = document.getElementById("rbxmFile");
 const output = document.getElementById("output");
 const tree = document.getElementById("tree");
 
+console.log("app.js загружен");
+
 if (!fileInput) {
     console.error("Не найден input #rbxmFile");
 }
